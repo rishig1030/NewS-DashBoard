@@ -1,0 +1,15 @@
+/* Our font (Public Sans) from Google Fonts. This line must stay on top. */
+@import url('https://fonts.googleapis.com/css2?family=Public+Sans:wght@400;500;600;700;800&display=swap');
+
+/* Turns Tailwind CSS on. (This single line replaces the three
+   "@tailwind base/components/utilities" lines from older tutorials.) */
+@import 'tailwindcss';
+
+/* Use Public Sans as the default font without relying on Tailwind's custom @theme rule */
+:root {
+  --font-sans: 'Public Sans', ui-sans-serif, system-ui, sans-serif;
+}
+
+body {
+  font-family: var(--font-sans);
+}
