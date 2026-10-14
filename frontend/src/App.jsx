@@ -4,7 +4,6 @@ import { useEffect, useState } from 'react';
 import Navbar from './components/Navbar.jsx';
 import NewsCard from './components/NewsCard.jsx';
 import { fetchNews } from './services/api.js';
-
 // The tabs. Each "id" must match a key in SOURCES inside backend/server.js.
 const SOURCES = [
   { id: 'bbc-news', name: 'BBC News', initials: 'BBC', color: '#BB1919' },
