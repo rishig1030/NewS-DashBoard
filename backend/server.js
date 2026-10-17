@@ -1,14 +1,20 @@
 // =============================================================================
-// Front Page - backend server
+// Front Page - backend server  (VERSION 2: country -> channel -> articles)
 //
 // What this file does:
 //   1. Starts a web server (Express) that our React app talks to.
-//   2. When React asks for "bbc-news" headlines, we ask NewsAPI.org for them.
-//   3. We tidy the data up and REMEMBER it for a few minutes (a "cache"),
-//      so we don't burn through the free limit of 100 NewsAPI requests/day.
-//   4. If anything goes wrong, we send back a clear, human-readable message.
+//   2. GET /api/sources?country=in   -> the news channels NewsAPI knows for India
+//   3. GET /api/news/the-hindu       -> the latest headlines from ONE channel
+//   4. Everything NewsAPI tells us is REMEMBERED for a while (a "cache"), so we
+//      don't burn through the free limit of 100 NewsAPI requests per day.
+//   5. If anything goes wrong, we send back a clear, human-readable message.
 //
 // Your secret keys live in the file named ".env" - never in this file.
+//
+// Legend for the comments below:
+//   NEW:     did not exist in version 1
+//   CHANGED: existed in version 1, but works differently now
+//   REMOVED: existed in version 1 and is gone
 // =============================================================================
 
 import dotenv from 'dotenv';
@@ -17,7 +23,6 @@ import cors from 'cors';
 import axios from 'axios';
 import mongoose from 'mongoose';
 
-// Read the settings from the ".env" file into process.env
 dotenv.config({ quiet: true });
 
 // -----------------------------------------------------------------------------
@@ -25,35 +30,32 @@ dotenv.config({ quiet: true });
 // -----------------------------------------------------------------------------
 const PORT = process.env.PORT || 5001;
 const NEWS_API_KEY = process.env.NEWS_API_KEY;
-const NEWS_API_URL = 'https://newsapi.org/v2/top-headlines';
-const NEWS_COUNTRY = process.env.NEWS_COUNTRY || 'us';
-const CACHE_MINUTES = Number(process.env.CACHE_MINUTES) || 15;
 
-// Websites that are allowed to call this server (comma-separated in .env)
+// CHANGED: this is now the base address; each request adds its own ending
+const NEWS_API_BASE_URL = 'https://newsapi.org/v2';
+
+// How long headlines are reused before we ask NewsAPI again
+const ARTICLES_CACHE_MINUTES = Number(process.env.CACHE_MINUTES) || 15;
+
+// NEW: the list of channels in a country almost never changes, so keep it a day
+const SOURCES_CACHE_MINUTES = 24 * 60;
+
 const ALLOWED_ORIGINS = (process.env.CLIENT_URL || 'http://localhost:5173')
   .split(',')
   .map((origin) => origin.trim());
 
-// -----------------------------------------------------------------------------
-// 2. The tabs we support
-//    The key (e.g. "bbc-news") is what the React app sends us.
-//    "query" is what we send to NewsAPI.
-//    NOTE: NewsAPI does not allow "sources" to be mixed with "category"/"country".
-// -----------------------------------------------------------------------------
-const SOURCES = {
-  'bbc-news': { name: 'BBC News', query: { sources: 'bbc-news' } },
-  cnn: { name: 'CNN', query: { sources: 'cnn' } },
-  techcrunch: { name: 'TechCrunch', query: { sources: 'techcrunch' } },
-  'the-verge': { name: 'The Verge', query: { sources: 'the-verge' } },
-  wired: { name: 'Wired', query: { sources: 'wired' } },
-  'al-jazeera-english': { name: 'Al Jazeera', query: { sources: 'al-jazeera-english' } },
-  business: { name: 'Business', query: { category: 'business', country: NEWS_COUNTRY } },
-  science: { name: 'Science', query: { category: 'science', country: NEWS_COUNTRY } },
-};
+// NEW: the countries we accept (NewsAPI two-letter codes).
+// Must match the COUNTRIES list in frontend/src/components/CountrySelector.jsx
+const SUPPORTED_COUNTRIES = new Set(['in', 'us', 'gb', 'au', 'ca', 'de', 'fr', 'it', 'br', 'ar', 'za']);
+
+// NEW: a channel id is lowercase letters, digits and dashes, e.g. "the-hindu"
+const SOURCE_ID_PATTERN = /^[a-z0-9-]{1,60}$/;
+
+// REMOVED: the hard-coded SOURCES list and NEWS_COUNTRY setting. Channels now
+// come from NewsAPI itself, based on the country the visitor picks.
 
 // -----------------------------------------------------------------------------
-// 3. A custom error type: an Error that also carries an HTTP status code
-//    (404 = not found, 429 = too many requests, 502 = other server failed...)
+// 2. A custom error type: an Error that also carries an HTTP status code
 // -----------------------------------------------------------------------------
 class HttpError extends Error {
   constructor(status, message) {
@@ -63,31 +65,22 @@ class HttpError extends Error {
 }
 
 // -----------------------------------------------------------------------------
-// 4. Database (MongoDB) - used as a long-term memory for the cache.
-//    The app still works without it, using only short-term memory (RAM).
+// 3. Database (MongoDB) - long-term memory for the cache (optional)
+//
+// CHANGED: version 1 stored only articles. Now one generic "box" stores
+// anything we cache: a list of articles OR a list of channels.
+//   key  = "articles:the-hindu"  or  "sources:in"
+//   data = whatever we want to remember
+// This uses a NEW collection, so older cached data is simply ignored.
 // -----------------------------------------------------------------------------
-const articleSchema = new mongoose.Schema(
-  {
-    url: String,
-    title: String,
-    description: String,
-    imageUrl: String,
-    author: String,
-    sourceName: String,
-    publishedAt: String,
-  },
-  { _id: false }
-);
-
-const newsCacheSchema = new mongoose.Schema({
-  sourceId: { type: String, required: true, unique: true },
-  articles: [articleSchema],
+const cacheEntrySchema = new mongoose.Schema({
+  key: { type: String, required: true, unique: true },
+  data: mongoose.Schema.Types.Mixed,
   fetchedAt: { type: Date, default: Date.now },
 });
 
-const NewsCache = mongoose.model('NewsCache', newsCacheSchema);
+const CacheEntry = mongoose.model('CacheEntry', cacheEntrySchema);
 
-// readyState 1 means "connected"
 const dbIsReady = () => mongoose.connection.readyState === 1;
 
 async function connectDatabase() {
@@ -104,22 +97,22 @@ async function connectDatabase() {
 }
 
 // -----------------------------------------------------------------------------
-// 5. Cache helpers
+// 4. Cache helpers
 //    Short-term memory: a Map that lives while the server runs.
 //    Long-term memory: MongoDB (survives restarts), only when connected.
 // -----------------------------------------------------------------------------
-const memoryCache = new Map(); // sourceId -> { articles, fetchedAt }
+const memoryCache = new Map(); // key -> { data, fetchedAt }
 
-async function readCache(sourceId) {
-  const inMemory = memoryCache.get(sourceId);
+async function readCache(key) {
+  const inMemory = memoryCache.get(key);
   if (inMemory) return inMemory;
 
   if (!dbIsReady()) return null;
   try {
-    const doc = await NewsCache.findOne({ sourceId }).lean();
+    const doc = await CacheEntry.findOne({ key }).lean();
     if (doc) {
-      const entry = { articles: doc.articles, fetchedAt: doc.fetchedAt };
-      memoryCache.set(sourceId, entry);
+      const entry = { data: doc.data, fetchedAt: doc.fetchedAt };
+      memoryCache.set(key, entry);
       return entry;
     }
   } catch (err) {
@@ -128,13 +121,13 @@ async function readCache(sourceId) {
   return null;
 }
 
-async function writeCache(sourceId, articles) {
-  const entry = { articles, fetchedAt: new Date() };
-  memoryCache.set(sourceId, entry);
+async function writeCache(key, data) {
+  const entry = { data, fetchedAt: new Date() };
+  memoryCache.set(key, entry);
 
   if (dbIsReady()) {
     try {
-      await NewsCache.updateOne({ sourceId }, { $set: entry }, { upsert: true });
+      await CacheEntry.updateOne({ key }, { $set: entry }, { upsert: true });
     } catch (err) {
       console.warn(`Could not save cache to MongoDB: ${err.message}`);
     }
@@ -142,29 +135,45 @@ async function writeCache(sourceId, articles) {
   return entry;
 }
 
-// "Fresh" = saved less than CACHE_MINUTES minutes ago
-const isFresh = (entry) => Date.now() - new Date(entry.fetchedAt).getTime() < CACHE_MINUTES * 60 * 1000;
+const isFresh = (entry, ttlMinutes) => Date.now() - new Date(entry.fetchedAt).getTime() < ttlMinutes * 60 * 1000;
+
+// NEW: ONE function that both endpoints use. It does the whole routine:
+//   fresh copy saved?  -> use it
+//   otherwise          -> ask NewsAPI, save the answer
+//   NewsAPI failed?    -> use an older saved copy if we have one
+async function getWithCache(key, ttlMinutes, fetchFresh) {
+  const cached = await readCache(key);
+  if (cached && isFresh(cached, ttlMinutes)) {
+    return { ...cached, cached: true, stale: false };
+  }
+
+  try {
+    const data = await fetchFresh();
+    const entry = await writeCache(key, data);
+    return { ...entry, cached: false, stale: false };
+  } catch (err) {
+    if (!cached) throw err;
+    console.warn(`Serving an older saved copy of "${key}" because: ${err.message}`);
+    return { ...cached, cached: true, stale: true };
+  }
+}
 
 // -----------------------------------------------------------------------------
-// 6. Talking to NewsAPI
+// 5. Talking to NewsAPI
 // -----------------------------------------------------------------------------
-
-// Remove any HTML tags (like <p> or <a>) from a piece of text
 const stripHtml = (text) => (text ? text.replace(/<[^>]*>/g, '').trim() : null);
 
-// NewsAPI sometimes puts a web address or a very long text in "author"
 const cleanAuthor = (author) => {
   if (!author || author.startsWith('http') || author.length > 80) return null;
   return author.trim();
 };
 
-// Turn NewsAPI's messy articles into a small, clean shape for the frontend
+// Unchanged from version 1: tidy up NewsAPI's articles
 function normalizeArticles(rawArticles = []) {
   const articles = [];
   const seenUrls = new Set();
 
   for (const raw of rawArticles) {
-    // Skip broken, removed or duplicate articles
     if (!raw.url || !raw.title || raw.title === '[Removed]') continue;
     if (seenUrls.has(raw.url)) continue;
     seenUrls.add(raw.url);
@@ -182,12 +191,30 @@ function normalizeArticles(rawArticles = []) {
   return articles;
 }
 
-// Convert errors from NewsAPI into friendly messages
+// NEW: tidy up NewsAPI's list of channels, keeping only what the screen needs
+function normalizeSources(rawSources = []) {
+  return rawSources
+    .filter((raw) => raw.id && raw.name)
+    .map((raw) => ({
+      id: raw.id,
+      name: raw.name,
+      description: raw.description || null,
+      url: raw.url || null,
+      category: raw.category || null,
+      language: raw.language || null,
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// CHANGED: one new "unknown channel" message; everything else as before
 function translateNewsApiError(err) {
   if (!axios.isAxiosError(err)) return err;
 
   if (err.response) {
     const { status, data } = err.response;
+    if (status === 400 && data?.code === 'sourceDoesNotExist') {
+      return new HttpError(404, 'NewsAPI does not know that news channel.');
+    }
     if (status === 429) {
       return new HttpError(429, 'The NewsAPI daily limit (100 requests on the free plan) has been reached. Try again tomorrow.');
     }
@@ -202,42 +229,44 @@ function translateNewsApiError(err) {
   return new HttpError(502, 'Could not reach NewsAPI. Check your internet connection.');
 }
 
-async function fetchHeadlines(source) {
+// NEW: the ONE place where we actually call NewsAPI. Both endpoints use it.
+async function callNewsApi(path, params) {
+  if (!NEWS_API_KEY) {
+    throw new HttpError(500, 'The server has no NEWS_API_KEY. Add it to backend/.env and restart the server.');
+  }
   try {
-    const response = await axios.get(NEWS_API_URL, {
+    const response = await axios.get(`${NEWS_API_BASE_URL}${path}`, {
       headers: { 'X-Api-Key': NEWS_API_KEY }, // the key travels in a header, not in the web address
-      params: { ...source.query, pageSize: 20 },
+      params,
       timeout: 10000,
     });
-    return normalizeArticles(response.data.articles);
+    return response.data;
   } catch (err) {
     throw translateNewsApiError(err);
   }
 }
 
-// The exact shape of what we send back to React
-function buildResponse(sourceId, source, entry, { cached = false, stale = false } = {}) {
-  return {
-    source: sourceId,
-    name: source.name,
-    cached,
-    stale,
-    fetchedAt: entry.fetchedAt,
-    articles: entry.articles,
-  };
+// NEW: NewsAPI  GET /v2/top-headlines/sources?country=in
+async function fetchSourcesFromNewsApi(country) {
+  const data = await callNewsApi('/top-headlines/sources', { country });
+  return normalizeSources(data.sources);
+}
+
+// CHANGED: NewsAPI  GET /v2/top-headlines?sources=the-hindu
+// (version 1 got this from the hard-coded list; now any channel id works)
+async function fetchHeadlinesFromNewsApi(sourceId) {
+  const data = await callNewsApi('/top-headlines', { sources: sourceId, pageSize: 20 });
+  return normalizeArticles(data.articles);
 }
 
 // -----------------------------------------------------------------------------
-// 7. The web server and its routes
+// 6. The web server and its routes
 // -----------------------------------------------------------------------------
 const app = express();
 
-// CORS = the browser's safety rule that blocks websites from calling other
-// websites. We only allow the addresses listed in CLIENT_URL.
 app.use(
   cors({
     origin(origin, callback) {
-      // No "origin" means a direct visit (browser address bar, curl) - allow it
       if (!origin || ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
       return callback(new HttpError(403, `Origin ${origin} is not allowed by CORS.`));
     },
@@ -246,7 +275,7 @@ app.use(
 );
 app.use(express.json());
 
-// Route 1: a quick "is the server alive?" check
+// Route 1 (unchanged): a quick "is the server alive?" check
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
@@ -255,38 +284,51 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Route 2: headlines for one tab, e.g. /api/news/bbc-news
+// Route 2 (NEW): the channels for one country, e.g. /api/sources?country=in
+app.get('/api/sources', async (req, res) => {
+  const country = String(req.query.country ?? '').toLowerCase();
+
+  if (!SUPPORTED_COUNTRIES.has(country)) {
+    throw new HttpError(
+      400,
+      `Please give a supported country code, for example /api/sources?country=in (supported: ${[...SUPPORTED_COUNTRIES].join(', ')}).`
+    );
+  }
+
+  const result = await getWithCache(`sources:${country}`, SOURCES_CACHE_MINUTES, () =>
+    fetchSourcesFromNewsApi(country)
+  );
+
+  res.json({
+    country,
+    sources: result.data,
+    cached: result.cached,
+    stale: result.stale,
+    fetchedAt: result.fetchedAt,
+  });
+});
+
+// Route 3 (CHANGED): the latest headlines from ONE channel, e.g. /api/news/the-hindu
+// Version 1 only accepted channels from a fixed list. Now any well-formed
+// channel id is passed on to NewsAPI. (When we go live we will add rate limiting.)
 app.get('/api/news/:sourceId', async (req, res) => {
   const { sourceId } = req.params;
 
-  // Only accept tabs we know about
-  if (!Object.hasOwn(SOURCES, sourceId)) {
-    throw new HttpError(404, `Unknown news source "${sourceId}".`);
-  }
-  const source = SOURCES[sourceId];
-
-  // Is there a recent saved answer? Then use it - no NewsAPI request needed.
-  const cached = await readCache(sourceId);
-  if (cached && isFresh(cached)) {
-    return res.json(buildResponse(sourceId, source, cached, { cached: true }));
+  if (!SOURCE_ID_PATTERN.test(sourceId)) {
+    throw new HttpError(400, 'That does not look like a valid news channel id.');
   }
 
-  // Otherwise ask NewsAPI for fresh headlines
-  let entry;
-  try {
-    if (!NEWS_API_KEY) {
-      throw new HttpError(500, 'The server has no NEWS_API_KEY. Add it to backend/.env and restart the server.');
-    }
-    const articles = await fetchHeadlines(source);
-    entry = await writeCache(sourceId, articles);
-  } catch (err) {
-    if (!cached) throw err;
-    // NewsAPI failed, but we have an older saved copy - better than nothing
-    console.warn(`Serving an older saved copy of "${sourceId}" because: ${err.message}`);
-    return res.json(buildResponse(sourceId, source, cached, { cached: true, stale: true }));
-  }
+  const result = await getWithCache(`articles:${sourceId}`, ARTICLES_CACHE_MINUTES, () =>
+    fetchHeadlinesFromNewsApi(sourceId)
+  );
 
-  res.json(buildResponse(sourceId, source, entry));
+  res.json({
+    source: sourceId,
+    articles: result.data,
+    cached: result.cached,
+    stale: result.stale,
+    fetchedAt: result.fetchedAt,
+  });
 });
 
 // Anything else: "page not found"
@@ -305,7 +347,7 @@ app.use((err, req, res, next) => {
 });
 
 // -----------------------------------------------------------------------------
-// 8. Start everything
+// 7. Start everything
 // -----------------------------------------------------------------------------
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
